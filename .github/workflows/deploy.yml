@@ -1,0 +1,112 @@
+name: Deploy Application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frappe_kamal/**'
+      - 'apps.json'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Deployment action'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - rollback
+          - restart
+          - stop
+      version:
+        description: 'Version/tag to deploy (optional, for rollback)'
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    name: Kamal Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+
+      - name: Install Kamal
+        run: gem install kamal
+
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Configure Kamal Secrets
+        working-directory: ./frappe_kamal
+        run: |
+          mkdir -p .kamal
+          cat > .kamal/secrets <<EOF
+          KAMAL_REGISTRY_PASSWORD=${{ secrets.DOCKER_HUB_TOKEN }}
+          MARIADB_ROOT_PASSWORD=${{ secrets.MARIADB_ROOT_PASSWORD }}
+          ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+          ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}
+          EOF
+
+      - name: Set Environment
+        run: |
+          echo "DEPLOY_HOST=${{ secrets.DEPLOY_HOST }}" >> $GITHUB_ENV
+          echo "SITE_NAME=${{ vars.SITE_NAME || 'erp.example.com' }}" >> $GITHUB_ENV
+          echo "DOCKER_REGISTRY=${{ vars.DOCKER_REGISTRY || 'docker.io' }}" >> $GITHUB_ENV
+          echo "DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}" >> $GITHUB_ENV
+
+      - name: Deploy
+        if: github.event.inputs.action == 'deploy' || github.event.inputs.action == ''
+        working-directory: ./frappe_kamal
+        run: kamal deploy
+
+      - name: Rollback
+        if: github.event.inputs.action == 'rollback'
+        working-directory: ./frappe_kamal
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            kamal rollback ${{ github.event.inputs.version }}
+          else
+            kamal rollback
+          fi
+
+      - name: Restart
+        if: github.event.inputs.action == 'restart'
+        working-directory: ./frappe_kamal
+        run: kamal app restart
+
+      - name: Stop
+        if: github.event.inputs.action == 'stop'
+        working-directory: ./frappe_kamal
+        run: kamal app stop
+
+      - name: Health Check
+        if: github.event.inputs.action != 'stop'
+        run: |
+          echo "Waiting for application to be healthy..."
+          sleep 30
+          curl -sf "https://${{ vars.SITE_NAME || secrets.DEPLOY_HOST }}/api/method/ping" || echo "Health check endpoint not available yet"
+
+      - name: Deployment Summary
+        run: |
+          echo "## Deployment Complete 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ github.event.inputs.action || 'deploy' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Host:** ${{ secrets.DEPLOY_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Site:** ${{ vars.SITE_NAME || 'erp.example.com' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

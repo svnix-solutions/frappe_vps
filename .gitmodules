@@ -1,0 +1,6 @@
+[submodule "frappe_kamal"]
+	path = frappe_kamal
+	url = https://github.com/svnix-solutions/frappe_kamal
+[submodule "frappe_terraform"]
+	path = frappe_terraform
+	url = https://svnix-solutions@github.com/svnix-solutions/frappe_terraform.git

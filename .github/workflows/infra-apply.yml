@@ -1,0 +1,97 @@
+name: Infrastructure Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frappe_terraform/**'
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Cloud provider to use'
+        required: true
+        default: 'hetzner'
+        type: choice
+        options:
+          - hetzner
+          - digitalocean
+          - vultr
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.6.0'
+
+jobs:
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Set Working Directory
+        id: workdir
+        run: |
+          PROVIDER="${{ github.event.inputs.provider || 'hetzner' }}"
+          echo "dir=./frappe_terraform/providers/${PROVIDER}" >> $GITHUB_OUTPUT
+
+      - name: Configure Terraform Variables
+        working-directory: ${{ steps.workdir.outputs.dir }}
+        run: |
+          cat > terraform.tfvars <<EOF
+          hcloud_token    = "${{ secrets.HCLOUD_TOKEN }}"
+          ssh_key_names   = ${{ secrets.SSH_KEY_NAMES }}
+          project_name    = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment     = "${{ vars.ENVIRONMENT || 'production' }}"
+          server_type     = "${{ vars.SERVER_TYPE || 'cx31' }}"
+          server_location = "${{ vars.SERVER_LOCATION || 'fsn1' }}"
+          EOF
+
+      - name: Terraform Init
+        working-directory: ${{ steps.workdir.outputs.dir }}
+        run: terraform init
+
+      - name: Terraform Apply
+        if: github.event.inputs.action != 'destroy'
+        working-directory: ${{ steps.workdir.outputs.dir }}
+        run: terraform apply -auto-approve
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        working-directory: ${{ steps.workdir.outputs.dir }}
+        run: terraform destroy -auto-approve
+
+      - name: Save Outputs
+        if: github.event.inputs.action != 'destroy'
+        working-directory: ${{ steps.workdir.outputs.dir }}
+        run: |
+          terraform output -json > ../../../terraform-outputs.json
+          echo "## Terraform Outputs" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          terraform output -json | jq '.' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Outputs Artifact
+        if: github.event.inputs.action != 'destroy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: terraform-outputs.json
+          retention-days: 90

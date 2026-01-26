@@ -1,0 +1,87 @@
+name: Backup Management
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Backup action'
+        required: true
+        default: 'create'
+        type: choice
+        options:
+          - create
+          - list
+          - snapshot
+
+jobs:
+  backup:
+    name: Manage Backups
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create Database Backup
+        if: github.event.inputs.action == 'create' || github.event.inputs.action == ''
+        run: |
+          ssh root@${{ secrets.DEPLOY_HOST }} << 'EOF'
+            # Trigger backup via Kamal
+            docker exec -t $(docker ps -qf "name=frappe-db-backup") \
+              /bin/sh -c "restic backup /backup --tag scheduled"
+
+            # Also create ERPNext backup
+            docker exec -t $(docker ps -qf "name=frappe-web") \
+              bench --site ${{ vars.SITE_NAME || 'all' }} backup --with-files
+          EOF
+
+      - name: List Backups
+        if: github.event.inputs.action == 'list'
+        run: |
+          ssh root@${{ secrets.DEPLOY_HOST }} << 'EOF'
+            echo "=== Restic Snapshots ==="
+            docker exec -t $(docker ps -qf "name=frappe-db-backup") \
+              restic snapshots
+
+            echo ""
+            echo "=== ERPNext Backups ==="
+            ls -lah /mnt/backups/
+          EOF
+
+      - name: Create Volume Snapshot
+        if: github.event.inputs.action == 'snapshot'
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          # Install Hetzner CLI
+          curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz | tar xz
+          chmod +x hcloud
+
+          # Create snapshots of all volumes
+          for vol in sites db-data backups logs redis; do
+            VOL_ID=$(./hcloud volume list -o columns=id,name | grep "frappe-production-${vol}" | awk '{print $1}')
+            if [ -n "$VOL_ID" ]; then
+              echo "Creating snapshot for volume: ${vol} (ID: ${VOL_ID})"
+              ./hcloud volume create-snapshot $VOL_ID --description "Scheduled snapshot $(date +%Y-%m-%d)"
+            fi
+          done
+
+      - name: Backup Summary
+        run: |
+          echo "## Backup Complete 💾" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ github.event.inputs.action || 'create' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "**Host:** ${{ secrets.DEPLOY_HOST }}" >> $GITHUB_STEP_SUMMARY
