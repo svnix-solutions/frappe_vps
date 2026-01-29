@@ -17,6 +17,10 @@ on:
           - hetzner
           - digitalocean
           - vultr
+          - aws
+          - gcp
+          - ovhcloud
+          - e2enetworks
       action:
         description: 'Terraform action'
         required: true
@@ -31,7 +35,7 @@ env:
 
 jobs:
   apply:
-    name: Terraform Apply
+    name: Terraform ${{ github.event.inputs.action || 'apply' }} - ${{ github.event.inputs.provider || 'hetzner' }}
     runs-on: ubuntu-latest
     environment: production
 
@@ -46,52 +50,173 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Set Working Directory
-        id: workdir
+      - name: Set Provider
+        id: provider
         run: |
           PROVIDER="${{ github.event.inputs.provider || 'hetzner' }}"
+          echo "name=$PROVIDER" >> $GITHUB_OUTPUT
           echo "dir=./frappe_terraform/providers/${PROVIDER}" >> $GITHUB_OUTPUT
 
-      - name: Configure Terraform Variables
-        working-directory: ${{ steps.workdir.outputs.dir }}
+      # =============================================================================
+      # Provider-specific configuration
+      # =============================================================================
+
+      - name: Configure Terraform Variables - Hetzner
+        if: steps.provider.outputs.name == 'hetzner'
+        working-directory: ${{ steps.provider.outputs.dir }}
         run: |
           cat > terraform.tfvars <<EOF
           hcloud_token    = "${{ secrets.HCLOUD_TOKEN }}"
-          ssh_key_names   = ${{ secrets.SSH_KEY_NAMES }}
+          ssh_key_names   = ${{ secrets.HETZNER_SSH_KEY_NAMES || '["default"]' }}
           project_name    = "${{ vars.PROJECT_NAME || 'frappe' }}"
           environment     = "${{ vars.ENVIRONMENT || 'production' }}"
-          server_type     = "${{ vars.SERVER_TYPE || 'cx31' }}"
-          server_location = "${{ vars.SERVER_LOCATION || 'fsn1' }}"
+          server_type     = "${{ vars.HETZNER_SERVER_TYPE || 'cx31' }}"
+          server_location = "${{ vars.HETZNER_LOCATION || 'fsn1' }}"
           EOF
 
+      - name: Configure Terraform Variables - DigitalOcean
+        if: steps.provider.outputs.name == 'digitalocean'
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          cat > terraform.tfvars <<EOF
+          do_token       = "${{ secrets.DIGITALOCEAN_TOKEN }}"
+          ssh_key_names  = ${{ secrets.DIGITALOCEAN_SSH_KEY_NAMES || '["default"]' }}
+          project_name   = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment    = "${{ vars.ENVIRONMENT || 'production' }}"
+          droplet_size   = "${{ vars.DIGITALOCEAN_DROPLET_SIZE || 's-4vcpu-8gb' }}"
+          region         = "${{ vars.DIGITALOCEAN_REGION || 'fra1' }}"
+          EOF
+
+      - name: Configure Terraform Variables - Vultr
+        if: steps.provider.outputs.name == 'vultr'
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          cat > terraform.tfvars <<EOF
+          vultr_api_key  = "${{ secrets.VULTR_API_KEY }}"
+          ssh_key_ids    = ${{ secrets.VULTR_SSH_KEY_IDS || '[]' }}
+          project_name   = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment    = "${{ vars.ENVIRONMENT || 'production' }}"
+          plan           = "${{ vars.VULTR_PLAN || 'vc2-4c-8gb' }}"
+          region         = "${{ vars.VULTR_REGION || 'fra' }}"
+          EOF
+
+      - name: Configure Terraform Variables - AWS
+        if: steps.provider.outputs.name == 'aws'
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          cat > terraform.tfvars <<EOF
+          aws_access_key = "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws_secret_key = "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          ssh_key_name   = "${{ secrets.AWS_SSH_KEY_NAME || 'default' }}"
+          project_name   = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment    = "${{ vars.ENVIRONMENT || 'production' }}"
+          instance_type  = "${{ vars.AWS_INSTANCE_TYPE || 't3.large' }}"
+          region         = "${{ vars.AWS_REGION || 'eu-central-1' }}"
+          EOF
+
+      - name: Configure Terraform Variables - GCP
+        if: steps.provider.outputs.name == 'gcp'
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          # Write GCP credentials to file
+          echo '${{ secrets.GCP_CREDENTIALS_JSON }}' > /tmp/gcp-credentials.json
+
+          cat > terraform.tfvars <<EOF
+          gcp_credentials_file = "/tmp/gcp-credentials.json"
+          project_id           = "${{ secrets.GCP_PROJECT_ID }}"
+          ssh_public_key       = "${{ secrets.GCP_SSH_PUBLIC_KEY }}"
+          project_name         = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment          = "${{ vars.ENVIRONMENT || 'production' }}"
+          machine_type         = "${{ vars.GCP_MACHINE_TYPE || 'e2-standard-2' }}"
+          region               = "${{ vars.GCP_REGION || 'europe-west3' }}"
+          zone                 = "${{ vars.GCP_ZONE || 'europe-west3-a' }}"
+          EOF
+
+      - name: Configure Terraform Variables - OVHcloud
+        if: steps.provider.outputs.name == 'ovhcloud'
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          cat > terraform.tfvars <<EOF
+          ovh_endpoint           = "${{ vars.OVH_ENDPOINT || 'ovh-eu' }}"
+          ovh_application_key    = "${{ secrets.OVH_APPLICATION_KEY }}"
+          ovh_application_secret = "${{ secrets.OVH_APPLICATION_SECRET }}"
+          ovh_consumer_key       = "${{ secrets.OVH_CONSUMER_KEY }}"
+          openstack_username     = "${{ secrets.OVH_OPENSTACK_USERNAME }}"
+          openstack_password     = "${{ secrets.OVH_OPENSTACK_PASSWORD }}"
+          openstack_tenant_name  = "${{ secrets.OVH_OPENSTACK_TENANT }}"
+          ssh_key_name           = "${{ secrets.OVH_SSH_KEY_NAME || 'default' }}"
+          project_name           = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment            = "${{ vars.ENVIRONMENT || 'production' }}"
+          flavor_name            = "${{ vars.OVH_FLAVOR || 'd2-8' }}"
+          region                 = "${{ vars.OVH_REGION || 'GRA11' }}"
+          EOF
+
+      - name: Configure Terraform Variables - E2E Networks
+        if: steps.provider.outputs.name == 'e2enetworks'
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          cat > terraform.tfvars <<EOF
+          e2e_api_key    = "${{ secrets.E2E_API_KEY }}"
+          ssh_key_ids    = ${{ secrets.E2E_SSH_KEY_IDS || '[]' }}
+          project_name   = "${{ vars.PROJECT_NAME || 'frappe' }}"
+          environment    = "${{ vars.ENVIRONMENT || 'production' }}"
+          plan_name      = "${{ vars.E2E_PLAN || 'C-4vCPU-8RAM' }}"
+          region         = "${{ vars.E2E_REGION || 'Delhi-NCR' }}"
+          EOF
+
+      # =============================================================================
+      # Terraform execution
+      # =============================================================================
+
       - name: Terraform Init
-        working-directory: ${{ steps.workdir.outputs.dir }}
+        working-directory: ${{ steps.provider.outputs.dir }}
         run: terraform init
 
       - name: Terraform Apply
         if: github.event.inputs.action != 'destroy'
-        working-directory: ${{ steps.workdir.outputs.dir }}
+        working-directory: ${{ steps.provider.outputs.dir }}
         run: terraform apply -auto-approve
 
       - name: Terraform Destroy
         if: github.event.inputs.action == 'destroy'
-        working-directory: ${{ steps.workdir.outputs.dir }}
+        working-directory: ${{ steps.provider.outputs.dir }}
         run: terraform destroy -auto-approve
+
+      # =============================================================================
+      # Output handling
+      # =============================================================================
 
       - name: Save Outputs
         if: github.event.inputs.action != 'destroy'
-        working-directory: ${{ steps.workdir.outputs.dir }}
+        working-directory: ${{ steps.provider.outputs.dir }}
         run: |
           terraform output -json > ../../../terraform-outputs.json
-          echo "## Terraform Outputs" >> $GITHUB_STEP_SUMMARY
+          echo "## Terraform Outputs - ${{ steps.provider.outputs.name }}" >> $GITHUB_STEP_SUMMARY
           echo '```json' >> $GITHUB_STEP_SUMMARY
           terraform output -json | jq '.' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Extract Server IP
+        if: github.event.inputs.action != 'destroy'
+        id: outputs
+        working-directory: ${{ steps.provider.outputs.dir }}
+        run: |
+          SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+          echo "Server IP: $SERVER_IP"
 
       - name: Upload Outputs Artifact
         if: github.event.inputs.action != 'destroy'
         uses: actions/upload-artifact@v4
         with:
-          name: terraform-outputs
+          name: terraform-outputs-${{ steps.provider.outputs.name }}
           path: terraform-outputs.json
           retention-days: 90
+
+      - name: Summary
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "**Provider:** ${{ steps.provider.outputs.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ github.event.inputs.action || 'apply' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

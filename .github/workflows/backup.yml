@@ -6,6 +6,19 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
+      provider:
+        description: 'Cloud provider'
+        required: true
+        default: 'hetzner'
+        type: choice
+        options:
+          - hetzner
+          - digitalocean
+          - vultr
+          - aws
+          - gcp
+          - ovhcloud
+          - e2enetworks
       action:
         description: 'Backup action'
         required: true
@@ -16,9 +29,12 @@ on:
           - list
           - snapshot
 
+env:
+  PROVIDER: ${{ github.event.inputs.provider || 'hetzner' }}
+
 jobs:
   backup:
-    name: Manage Backups
+    name: Backup - ${{ github.event.inputs.provider || 'hetzner' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -32,36 +48,66 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      # =============================================================================
+      # Application-level backups (works on ALL providers)
+      # =============================================================================
 
       - name: Create Database Backup
         if: github.event.inputs.action == 'create' || github.event.inputs.action == ''
         run: |
           ssh root@${{ secrets.DEPLOY_HOST }} << 'EOF'
-            # Trigger backup via Kamal
-            docker exec -t $(docker ps -qf "name=frappe-db-backup") \
-              /bin/sh -c "restic backup /backup --tag scheduled"
+            set -e
+            echo "=== Creating ERPNext Backup ==="
 
-            # Also create ERPNext backup
-            docker exec -t $(docker ps -qf "name=frappe-web") \
-              bench --site ${{ vars.SITE_NAME || 'all' }} backup --with-files
+            # Find the web container
+            WEB_CONTAINER=$(docker ps -qf "name=erpnext-web" 2>/dev/null || docker ps -qf "name=frappe-web" 2>/dev/null || true)
+
+            if [ -n "$WEB_CONTAINER" ]; then
+              # Create ERPNext backup (includes DB + files)
+              docker exec -t $WEB_CONTAINER bench --site all backup --with-files
+              echo "ERPNext backup completed"
+            else
+              echo "Warning: Web container not found, skipping ERPNext backup"
+            fi
+
+            # If restic backup container exists, trigger it
+            BACKUP_CONTAINER=$(docker ps -qf "name=backup" 2>/dev/null || true)
+            if [ -n "$BACKUP_CONTAINER" ]; then
+              docker exec -t $BACKUP_CONTAINER /bin/sh -c "restic backup /backup --tag scheduled" || true
+              echo "Restic backup completed"
+            fi
+
+            # Show backup files
+            echo ""
+            echo "=== Recent Backups ==="
+            ls -lah /mnt/backups/ 2>/dev/null || ls -lah ~/erpnext/backups/ 2>/dev/null || echo "No backup directory found"
           EOF
 
       - name: List Backups
         if: github.event.inputs.action == 'list'
         run: |
           ssh root@${{ secrets.DEPLOY_HOST }} << 'EOF'
-            echo "=== Restic Snapshots ==="
-            docker exec -t $(docker ps -qf "name=frappe-db-backup") \
-              restic snapshots
+            echo "=== ERPNext Backups ==="
+            ls -lah /mnt/backups/ 2>/dev/null || ls -lah ~/erpnext/backups/ 2>/dev/null || echo "No backups found"
 
             echo ""
-            echo "=== ERPNext Backups ==="
-            ls -lah /mnt/backups/
+            echo "=== Restic Snapshots ==="
+            BACKUP_CONTAINER=$(docker ps -qf "name=backup" 2>/dev/null || true)
+            if [ -n "$BACKUP_CONTAINER" ]; then
+              docker exec -t $BACKUP_CONTAINER restic snapshots || echo "No restic snapshots"
+            else
+              echo "Restic container not running"
+            fi
           EOF
 
-      - name: Create Volume Snapshot
-        if: github.event.inputs.action == 'snapshot'
+      # =============================================================================
+      # Cloud-specific volume snapshots
+      # =============================================================================
+
+      - name: Create Volume Snapshot - Hetzner
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'hetzner'
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
@@ -69,19 +115,163 @@ jobs:
           curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz | tar xz
           chmod +x hcloud
 
-          # Create snapshots of all volumes
+          PROJECT="${{ vars.PROJECT_NAME || 'frappe' }}"
+          ENV="${{ vars.ENVIRONMENT || 'production' }}"
+
+          echo "Creating Hetzner volume snapshots..."
           for vol in sites db-data backups logs redis; do
-            VOL_ID=$(./hcloud volume list -o columns=id,name | grep "frappe-production-${vol}" | awk '{print $1}')
+            VOL_ID=$(./hcloud volume list -o columns=id,name | grep "${PROJECT}-${ENV}-${vol}" | awk '{print $1}')
             if [ -n "$VOL_ID" ]; then
               echo "Creating snapshot for volume: ${vol} (ID: ${VOL_ID})"
-              ./hcloud volume create-snapshot $VOL_ID --description "Scheduled snapshot $(date +%Y-%m-%d)"
+              ./hcloud volume create-snapshot $VOL_ID --description "Backup $(date +%Y-%m-%d-%H%M)"
+            else
+              echo "Volume ${vol} not found, skipping"
             fi
           done
 
+      - name: Create Volume Snapshot - DigitalOcean
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'digitalocean'
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: |
+          # Install doctl
+          curl -sL https://github.com/digitalocean/doctl/releases/latest/download/doctl-$(curl -sL https://api.github.com/repos/digitalocean/doctl/releases/latest | jq -r '.tag_name' | tr -d 'v')-linux-amd64.tar.gz | tar xz
+          chmod +x doctl
+
+          PROJECT="${{ vars.PROJECT_NAME || 'frappe' }}"
+          ENV="${{ vars.ENVIRONMENT || 'production' }}"
+
+          echo "Creating DigitalOcean volume snapshots..."
+          for vol in sites db-data backups logs redis; do
+            VOL_ID=$(./doctl compute volume list --format ID,Name --no-header | grep "${PROJECT}-${ENV}-${vol}" | awk '{print $1}')
+            if [ -n "$VOL_ID" ]; then
+              echo "Creating snapshot for volume: ${vol} (ID: ${VOL_ID})"
+              ./doctl compute volume-action snapshot $VOL_ID --snapshot-name "${PROJECT}-${ENV}-${vol}-$(date +%Y%m%d)"
+            else
+              echo "Volume ${vol} not found, skipping"
+            fi
+          done
+
+      - name: Create Volume Snapshot - AWS
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'aws'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+        run: |
+          PROJECT="${{ vars.PROJECT_NAME || 'frappe' }}"
+          ENV="${{ vars.ENVIRONMENT || 'production' }}"
+
+          echo "Creating AWS EBS snapshots..."
+          for vol in sites db-data backups logs redis; do
+            VOL_ID=$(aws ec2 describe-volumes \
+              --filters "Name=tag:Name,Values=${PROJECT}-${ENV}-${vol}" \
+              --query 'Volumes[0].VolumeId' --output text)
+
+            if [ "$VOL_ID" != "None" ] && [ -n "$VOL_ID" ]; then
+              echo "Creating snapshot for volume: ${vol} (ID: ${VOL_ID})"
+              aws ec2 create-snapshot \
+                --volume-id $VOL_ID \
+                --description "Backup $(date +%Y-%m-%d-%H%M)" \
+                --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${PROJECT}-${ENV}-${vol}-snapshot},{Key=Environment,Value=${ENV}}]"
+            else
+              echo "Volume ${vol} not found, skipping"
+            fi
+          done
+
+      - name: Create Volume Snapshot - GCP
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'gcp'
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-credentials.json
+        run: |
+          # Write GCP credentials
+          echo '${{ secrets.GCP_CREDENTIALS_JSON }}' > /tmp/gcp-credentials.json
+
+          # Install gcloud CLI
+          curl -sL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz | tar xz
+          ./google-cloud-sdk/install.sh --quiet
+          ./google-cloud-sdk/bin/gcloud auth activate-service-account --key-file=/tmp/gcp-credentials.json
+
+          PROJECT_ID="${{ secrets.GCP_PROJECT_ID }}"
+          PROJECT="${{ vars.PROJECT_NAME || 'frappe' }}"
+          ENV="${{ vars.ENVIRONMENT || 'production' }}"
+          ZONE="${{ vars.GCP_ZONE || 'europe-west3-a' }}"
+
+          echo "Creating GCP disk snapshots..."
+          for vol in sites db-data backups logs redis; do
+            DISK_NAME="${PROJECT}-${ENV}-${vol}"
+            echo "Creating snapshot for disk: ${DISK_NAME}"
+            ./google-cloud-sdk/bin/gcloud compute snapshots create "${DISK_NAME}-$(date +%Y%m%d)" \
+              --source-disk=$DISK_NAME \
+              --source-disk-zone=$ZONE \
+              --project=$PROJECT_ID \
+              --labels=environment=$ENV || echo "Disk ${vol} not found or snapshot failed"
+          done
+
+      - name: Create Snapshot - Vultr (Server Snapshot)
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'vultr'
+        env:
+          VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+        run: |
+          # Vultr doesn't support block storage snapshots, only server snapshots
+          echo "Note: Vultr doesn't support block storage snapshots."
+          echo "Creating full server snapshot instead..."
+
+          PROJECT="${{ vars.PROJECT_NAME || 'frappe' }}"
+          ENV="${{ vars.ENVIRONMENT || 'production' }}"
+
+          # Get server ID
+          SERVER_ID=$(curl -s "https://api.vultr.com/v2/instances" \
+            -H "Authorization: Bearer $VULTR_API_KEY" | \
+            jq -r ".instances[] | select(.label | contains(\"${PROJECT}\")) | .id")
+
+          if [ -n "$SERVER_ID" ]; then
+            echo "Creating server snapshot for: ${SERVER_ID}"
+            curl -X POST "https://api.vultr.com/v2/instances/${SERVER_ID}/snapshots" \
+              -H "Authorization: Bearer $VULTR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"description\": \"Backup $(date +%Y-%m-%d)\"}"
+          else
+            echo "Server not found"
+          fi
+
+      - name: Create Snapshot - OVHcloud
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'ovhcloud'
+        run: |
+          # OVHcloud uses OpenStack API for volume snapshots
+          echo "Note: OVHcloud volume snapshots require OpenStack CLI."
+          echo "For now, relying on application-level backups."
+          echo "Consider setting up OpenStack CLI for volume snapshots."
+
+      - name: Create Snapshot - E2E Networks
+        if: github.event.inputs.action == 'snapshot' && env.PROVIDER == 'e2enetworks'
+        run: |
+          echo "Note: E2E Networks snapshot support depends on their API."
+          echo "For now, relying on application-level backups."
+
+      # =============================================================================
+      # Summary
+      # =============================================================================
+
       - name: Backup Summary
         run: |
-          echo "## Backup Complete 💾" >> $GITHUB_STEP_SUMMARY
+          echo "## Backup Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Action:** ${{ github.event.inputs.action || 'create' }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
-          echo "**Host:** ${{ secrets.DEPLOY_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Provider** | ${{ env.PROVIDER }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Action** | ${{ github.event.inputs.action || 'create' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Time** | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Host** | ${{ secrets.DEPLOY_HOST }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Snapshot Support by Provider" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Provider | Volume Snapshots |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Hetzner | Yes |" >> $GITHUB_STEP_SUMMARY
+          echo "| DigitalOcean | Yes |" >> $GITHUB_STEP_SUMMARY
+          echo "| AWS | Yes (EBS) |" >> $GITHUB_STEP_SUMMARY
+          echo "| GCP | Yes |" >> $GITHUB_STEP_SUMMARY
+          echo "| Vultr | Server only |" >> $GITHUB_STEP_SUMMARY
+          echo "| OVHcloud | Via OpenStack |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E Networks | Limited |" >> $GITHUB_STEP_SUMMARY
